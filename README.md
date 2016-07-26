@@ -38,3 +38,223 @@ To add Nexmo Verify to our app we are going to make the following changes:
 * Verify the code sent to their number
 
 ## Adding a phone number
+
+```sh
+# .env
+NEXMO_API_KEY=123
+NEXMO_API_SECRET=234
+```
+
+```python
+# polls/views.py
+from two_factor.mixins import TwoFactorMixin
+
+class OptionsView(TwoFactorMixin, DetailView):
+    ...
+
+class ResultsView(TwoFactorMixin, DetailView):
+    ...
+
+class VoteView(TwoFactorMixin,View):
+    ...
+```
+
+```python
+# pollstr/settings.py
+INSTALLED_APPS = [
+    'polls.apps.PollsConfig',
+    'two_factor.apps.TwoFactorConfig',
+    'django.contrib.admin',
+    ...
+]
+```
+
+```python
+# pollstr/urls.py
+urlpatterns = [
+    ...
+    url(r'^polls/', include('polls.urls')),
+    url(r'^2fa/', include('two_factor.urls')),
+]
+```
+
+```python
+# two_factor/mixins.py
+from django.contrib.auth.mixins import UserPassesTestMixin
+from django.core.urlresolvers import reverse
+
+class TwoFactorMixin(UserPassesTestMixin):
+    def test_func(self):
+        user = self.request.user
+        return (user.is_authenticated and "verified" in self.request.session)
+
+    def get_login_url(self):
+        if (self.request.user.is_authenticated()):
+            return reverse('two_factor:new')
+        else:
+            return reverse('login')
+```
+
+```python
+# two_factor/models.py
+from django.db import models
+from django.contrib.auth.models import User
+
+class TwoFactor(models.Model):
+    number = models.CharField(max_length=16)
+    user = models.OneToOneField(User)
+```
+
+```html
+<!-- two_factor/templates/two_factor/new.html -->
+{% extends 'polls/base.html' %}
+
+{% block content %}
+
+<form class='form-inline' action="{% url 'two_factor:create' %}" method="post">
+
+  {% csrf_token %}
+  <input type="hidden" name="next" value="{{ request.GET.next }}">
+
+  <p>
+    To continue we need to verify your phone number.
+  </p>
+
+  <div class="form-group">
+    <input type="text" name="number" value="{{ object.number }}"
+           {% if object.number %}disabled{% endif %} class='form-control'>
+  </div>
+  <div class="form-group">
+    <input type="submit" name="name" value="Verify" class='btn btn-primary'>
+  </div>
+</form>
+
+{% endblock %}
+```
+
+```html
+<!-- two_factor/templates/two_factor/verify.html -->
+{% extends 'polls/base.html' %}
+
+{% block content %}
+
+<form class='form-inline' action="{% url 'two_factor:confirm' %}" method="post">
+
+  {% csrf_token %}
+  <input type="hidden" name="next" value="{{request.GET.next}}">
+
+  <p>
+    We have sent a code to your number. Please type it in below.
+  </p>
+
+  <div class="form-group">
+    <input type="text" name="code" class='form-control'>
+
+  </div>
+  <div class="form-group">
+    <input type="submit" name="name" value="Confirm" class='btn btn-primary'>
+  </div>
+</form>
+
+{% endblock %}
+```
+
+```python
+# two_factor/urls.py
+from django.conf.urls import url
+
+from . import views
+
+app_name = 'two_factor'
+urlpatterns = [
+    url(r'^$', views.NewView.as_view(), name='new'),
+    url(r'^create/$', views.CreateView.as_view(), name='create'),
+    url(r'^verify/$', views.VerifyView.as_view(), name='verify'),
+    url(r'^confirm/$', views.ConfirmView.as_view(), name='confirm'),
+]
+```
+
+```python
+# two_factor/views.py
+from django.views.generic import DetailView
+from django.contrib.auth.mixins import LoginRequiredMixin
+
+from .models import TwoFactor
+
+class NewView(LoginRequiredMixin, DetailView):
+    template_name = 'two_factor/new.html'
+
+    def get_object(self):
+        try:
+            return self.request.user.twofactor
+        except TwoFactor.DoesNotExist:
+            return TwoFactor.objects.create(user=self.request.user)
+```
+
+
+```python
+# two_factor/views.py
+from django.views.generic import DetailView, View
+from django.contrib import messages
+from django.contrib.auth.mixins import LoginRequiredMixin
+from django.http import HttpResponseRedirect
+from django.core.urlresolvers import reverse
+from django.contrib.auth import logout
+
+import nexmo
+
+from .models import TwoFactor
+
+class CreateView(LoginRequiredMixin, View):
+    def post(self, request):
+        number = self.find_or_set_number(request)
+        response = self.send_verification_request(request, number)
+
+        if (response['status'] == '0'):
+            request.session['verification_id'] = response['request_id']
+        else:
+            logout(request)
+            messages.add_message(request, messages.INFO, 'Could not verify your number. Please contact support.')
+            return HttpResponseRedirect('/')
+
+        return HttpResponseRedirect(reverse('two_factor:verify')+"?next="+request.POST['next'])
+
+    def find_or_set_number(self, request):
+        two_factor = request.user.twofactor
+
+        if (not two_factor.number):
+            two_factor.number = request.POST['number']
+            two_factor.save()
+
+        return two_factor.number
+
+    def send_verification_request(self, request, number):
+        client = nexmo.Client()
+        return client.start_verification(number=number, brand='Pollstr')
+```
+
+```python
+# two_factor/views.py
+from django.views.generic import DetailView, View, TemplateView
+
+class VerifyView(LoginRequiredMixin, TemplateView):
+    template_name = 'two_factor/verify.html'
+```
+
+```python
+# two_factor/views.py
+class ConfirmView(LoginRequiredMixin, View):
+    def post(self, request):
+        response = self.check_verification_request(request)
+
+        if (response['status'] == '0'):
+            request.session['verified'] = True
+            return HttpResponseRedirect(request.POST['next'])
+        else:
+            messages.add_message(request, messages.INFO, 'Could not verify code. Please try again.')
+            return HttpResponseRedirect(reverse('two_factor:verify')+"?next="+request.POST['next'])
+
+
+    def check_verification_request(self, request):
+        return nexmo.Client().check_verification(request.session['verification_id'], code=request.POST['code'])
+```
